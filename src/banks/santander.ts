@@ -451,12 +451,43 @@ function formatCardLabel(cardName?: string, last4?: string): string {
   return `${name} ****${last4}`;
 }
 
-function parseUsdAmount(text?: string | null): number {
-  const clean = (text || "").replace(/[^0-9.,-]/g, "");
-  if (!clean) return 0;
+function extractLast4FromLabel(label: string): string {
+  return label.match(/\*{2,}\s*(\d{4})/)?.[1] ?? "";
+}
+
+/**
+ * Dedup key for credit cards captured while iterating the carousel.
+ *
+ * Swiper can render duplicate ("clone") slides for the same card, so repeats
+ * must collapse. Keying on the last 4 digits keeps genuinely different cards
+ * apart even when they share a product name and identical balances (twin
+ * cards) — the previous label+totals key collapsed those into one. Only when
+ * no last4 is available do we fall back to label+totals.
+ */
+export function creditCardDedupKey(card: CreditCardBalance): string {
+  const last4 = extractLast4FromLabel(card.label);
+  if (last4) return `last4:${last4}`;
+  return `content:${card.label}|${card.national?.total ?? ""}|${card.international?.total ?? ""}`;
+}
+
+export function parseUsdAmount(text?: string | null): number {
+  const raw = (text ?? "").trim();
+  const clean = raw.replace(/[^0-9.,-]/g, "");
   const normalized = clean.replace(/\./g, "").replace(",", ".");
   const amount = Number.parseFloat(normalized);
-  return Number.isNaN(amount) ? 0 : amount;
+  if (Number.isNaN(amount)) {
+    // Santander renders USD amounts in Chilean format ("." thousands, "," decimals).
+    // A non-empty value that fails to parse means the portal likely changed its
+    // display format — warn instead of silently returning 0 so the regression is
+    // visible in logs rather than surfacing as a bogus $0 cupo.
+    if (raw) {
+      console.warn(
+        `[santander] parseUsdAmount: monto USD con formato inesperado, no se pudo parsear "${raw}"`,
+      );
+    }
+    return 0;
+  }
+  return amount;
 }
 
 async function getActiveCreditCardSlideIndex(page: Page): Promise<number> {
@@ -492,6 +523,23 @@ async function listCreditCardSlides(page: Page): Promise<CreditCardSlide[]> {
 
 async function selectCreditCardSlide(page: Page, index: number): Promise<boolean> {
   const clicked = await page.evaluate((targetIndex: number) => {
+    // Preferred: drive the Swiper instance API directly. The live portal
+    // renders no pagination bullets and no "Go to slide" controls, so the
+    // DOM-click fallbacks below are unreliable for actually changing slides;
+    // slideTo / slideToLoop is Swiper's canonical programmatic navigation.
+    const swiperEl = document.querySelector(
+      ".container-carusel .swiper-container, .container-carusel .swiper",
+    ) as (HTMLElement & { swiper?: any }) | null;
+    const swiper = swiperEl?.swiper;
+    if (swiper && typeof swiper.slideTo === "function") {
+      if (swiper.params?.loop && typeof swiper.slideToLoop === "function") {
+        swiper.slideToLoop(targetIndex);
+      } else {
+        swiper.slideTo(targetIndex);
+      }
+      return true;
+    }
+
     const byAria = document.querySelector(
       `.container-carusel [aria-label='Go to slide ${targetIndex + 1}']`,
     ) as HTMLElement | null;
@@ -527,9 +575,61 @@ async function selectCreditCardSlide(page: Page, index: number): Promise<boolean
   return (await getActiveCreditCardSlideIndex(page)) === index;
 }
 
+type RawCreditCardSection = {
+  header: string;
+  available: string | null;
+  used: string | null;
+  total: string | null;
+  currency: string;
+};
+
+type RawCreditCardMetadata = {
+  cardName: string;
+  last4: string;
+  sections: RawCreditCardSection[];
+  billingPeriod: string | null;
+  nextBillingDate: string | null;
+};
+
+/**
+ * Pure transform from the DOM-scraped raw shape into a {@link CreditCardBalance}.
+ * Kept separate from the `page.evaluate` scraping so it can be unit-tested as a
+ * smoke test that at least one card parses correctly without a live browser.
+ */
+export function buildCreditCardFromRaw(raw: RawCreditCardMetadata): CreditCardBalance | null {
+  const label = formatCardLabel(raw.cardName, raw.last4);
+  const card: CreditCardBalance = { label };
+
+  for (const section of raw.sections) {
+    if (!section.available && !section.used && !section.total) continue;
+
+    if (section.currency === "USD") {
+      card.international = {
+        used: Math.abs(parseUsdAmount(section.used)),
+        available: parseUsdAmount(section.available),
+        total: parseUsdAmount(section.total),
+        currency: "USD",
+      };
+      continue;
+    }
+
+    card.national = {
+      used: Math.abs(parseChileanAmount(section.used || "0")),
+      available: parseChileanAmount(section.available || "0"),
+      total: parseChileanAmount(section.total || "0"),
+    };
+  }
+
+  if (!card.national && !card.international) return null;
+  if (raw.billingPeriod) card.billingPeriod = raw.billingPeriod;
+  if (raw.nextBillingDate) card.nextBillingDate = raw.nextBillingDate;
+  return card;
+}
+
 async function extractActiveCreditCardMetadata(page: Page): Promise<CreditCardBalance | null> {
-  const raw = await page.evaluate(() => {
+  const { raw, carouselPresent } = await page.evaluate(() => {
     const normalizeText = (value?: string | null) => value?.replace(/\s+/g, " ").trim() || "";
+    const carouselPresent = !!document.querySelector(".container-carusel");
     const activeSlide = document.querySelector(
       ".container-carusel .swiper-slide.swiper-slide-active",
     ) as HTMLElement | null;
@@ -570,52 +670,42 @@ async function extractActiveCreditCardMetadata(page: Page): Promise<CreditCardBa
         /Pr[oó]xima facturaci[oó]n\s+(\d{1,2}[\/.\-]\d{1,2}(?:[\/.\-]\d{2,4})?|\d{1,2}\s+[A-Za-záéíóúñ]+\s+\d{4})/i,
       )?.[1] || null;
 
-    return { cardName, last4, sections, billingPeriod, nextBillingDate };
+    return { raw: { cardName, last4, sections, billingPeriod, nextBillingDate }, carouselPresent };
   });
 
-  const label = formatCardLabel(raw.cardName, raw.last4);
-  const card: CreditCardBalance = { label };
+  const card = buildCreditCardFromRaw(raw);
 
-  for (const section of raw.sections) {
-    if (!section.available && !section.used && !section.total) continue;
-
-    if (section.currency === "USD") {
-      card.international = {
-        used: Math.abs(parseUsdAmount(section.used)),
-        available: parseUsdAmount(section.available),
-        total: parseUsdAmount(section.total),
-        currency: "USD",
-      };
-      continue;
-    }
-
-    card.national = {
-      used: Math.abs(parseChileanAmount(section.used || "0")),
-      available: parseChileanAmount(section.available || "0"),
-      total: parseChileanAmount(section.total || "0"),
-    };
+  // If the carousel container itself is gone the portal was redesigned; if it's
+  // present but no cupo parsed, the inner `.balance__container` selectors broke.
+  // Either way surface it instead of silently returning a card with no cupo.
+  if (!card) {
+    console.warn(
+      `[santander] no se extrajo cupo de la tarjeta activa ` +
+        `(carrusel=${carouselPresent ? "presente" : "ausente"}, secciones=${raw.sections.length}). ` +
+        `Los selectores del portal pueden haber cambiado.`,
+    );
   }
-
-  if (!card.national && !card.international) return null;
-  if (raw.billingPeriod) card.billingPeriod = raw.billingPeriod;
-  if (raw.nextBillingDate) card.nextBillingDate = raw.nextBillingDate;
   return card;
 }
 
-async function extractCreditCardMetadata(page: Page, debugLog: string[]): Promise<CreditCardBalance[]> {
+/** A captured credit card together with the carousel slide it came from, so the
+ *  statement pass can re-select that slide before reading its billing summary. */
+type CreditCardWithSlide = { card: CreditCardBalance; slideIndex: number };
+
+async function extractCreditCardMetadata(page: Page, debugLog: string[]): Promise<CreditCardWithSlide[]> {
   const slides = await listCreditCardSlides(page);
   const activeIndex = await getActiveCreditCardSlideIndex(page);
   const seen = new Set<string>();
-  const creditCards: CreditCardBalance[] = [];
+  const cards: CreditCardWithSlide[] = [];
 
   const captureCurrentSlide = async (slide: CreditCardSlide | null) => {
     const metadata = await extractActiveCreditCardMetadata(page);
     if (!metadata) return;
 
-    const key = `${metadata.label}|${metadata.national?.total ?? ""}|${metadata.international?.total ?? ""}`;
+    const key = creditCardDedupKey(metadata);
     if (seen.has(key)) return;
     seen.add(key);
-    creditCards.push(metadata);
+    cards.push({ card: metadata, slideIndex: slide ? slide.index : activeIndex });
 
     const national =
       metadata.national
@@ -631,7 +721,7 @@ async function extractCreditCardMetadata(page: Page, debugLog: string[]): Promis
 
   if (slides.length === 0) {
     await captureCurrentSlide(null);
-    return creditCards;
+    return cards;
   }
 
   for (const slide of slides) {
@@ -647,7 +737,7 @@ async function extractCreditCardMetadata(page: Page, debugLog: string[]): Promis
     await selectCreditCardSlide(page, activeIndex);
   }
 
-  return creditCards;
+  return cards;
 }
 
 type LastStatementRaw = {
@@ -974,12 +1064,11 @@ async function scrapeSantander(
   // 7b. Credit card movements
   debugLog.push("7b. Navigating to credit card movements...");
   progress("Extrayendo movimientos de tarjeta de crédito...");
+  let cardSlides: CreditCardWithSlide[] = [];
   const creditCardMovements: BankMovement[] = [];
-  let creditCards: CreditCardBalance[] | undefined;
   const tcReady = await navigateToCreditCardSection(page, debugLog);
   if (tcReady) {
-    const metadata = await extractCreditCardMetadata(page, debugLog);
-    if (metadata.length > 0) creditCards = metadata;
+    cardSlides = await extractCreditCardMetadata(page, debugLog);
 
     creditCardMovements.push(
       ...(await collectCreditCardTab(page, interceptor, debugLog, {
@@ -998,29 +1087,43 @@ async function scrapeSantander(
       })),
     );
 
-    if (creditCards && creditCards.length > 0) {
-      // The billing summary is only rendered inside the "movimientos facturados" view.
-      await clickTcTab(page, "movimientos facturados");
-      const rendered = await waitForStatementRender(page);
-      if (!rendered) {
-        debugLog.push(`  Statement anchor text did not appear within 10s`);
-      }
-      const statementRaw = await extractLastStatement(page);
-      const card = creditCards[0];
-      if (applyLastStatement(card, statementRaw)) {
-        debugLog.push(
-          `  Last statement [${card.label}]: billed=$${card.lastStatement!.billedAmount.toLocaleString("es-CL")}, ` +
-          `billingDate=${card.lastStatement!.billingDate}, dueDate=${card.lastStatement!.dueDate}` +
-          (card.lastStatement!.minimumPayment !== undefined
-            ? `, min=$${card.lastStatement!.minimumPayment.toLocaleString("es-CL")}`
-            : ""),
-        );
-      } else {
-        debugLog.push(
-          `  Last statement [${card.label}]: partial (billingDate=${statementRaw.billingDate ?? "—"}, ` +
-          `dueDate=${statementRaw.dueDate ?? "—"}, billed=${statementRaw.billedAmount ?? "—"}, ` +
-          `min=${statementRaw.minimumPayment ?? "—"})`,
-        );
+    if (cardSlides.length > 0) {
+      // Billing summary (statement info) for EVERY credit card, not just the first.
+      // The "movimientos facturados" view only reflects the card currently selected in the
+      // carousel, so each card's slide is re-selected before reading its statement.
+      let currentSlide = await getActiveCreditCardSlideIndex(page);
+      for (const { card, slideIndex } of cardSlides) {
+        if (slideIndex >= 0 && slideIndex !== currentSlide) {
+          if (await selectCreditCardSlide(page, slideIndex)) {
+            currentSlide = slideIndex;
+          } else {
+            debugLog.push(
+              `  Last statement [${card.label}]: no se pudo seleccionar la tarjeta (slide ${slideIndex + 1}), se omite`,
+            );
+            continue;
+          }
+        }
+        await clickTcTab(page, "movimientos facturados");
+        const rendered = await waitForStatementRender(page);
+        if (!rendered) {
+          debugLog.push(`  Statement anchor text did not appear within 10s [${card.label}]`);
+        }
+        const statementRaw = await extractLastStatement(page);
+        if (applyLastStatement(card, statementRaw)) {
+          debugLog.push(
+            `  Last statement [${card.label}]: billed=$${card.lastStatement!.billedAmount.toLocaleString("es-CL")}, ` +
+            `billingDate=${card.lastStatement!.billingDate}, dueDate=${card.lastStatement!.dueDate}` +
+            (card.lastStatement!.minimumPayment !== undefined
+              ? `, min=$${card.lastStatement!.minimumPayment.toLocaleString("es-CL")}`
+              : ""),
+          );
+        } else {
+          debugLog.push(
+            `  Last statement [${card.label}]: partial (billingDate=${statementRaw.billingDate ?? "—"}, ` +
+            `dueDate=${statementRaw.dueDate ?? "—"}, billed=${statementRaw.billedAmount ?? "—"}, ` +
+            `min=${statementRaw.minimumPayment ?? "—"})`,
+          );
+        }
       }
     }
   } else {
@@ -1047,8 +1150,11 @@ async function scrapeSantander(
   await doSave(page, "05-final");
   const ss = doScreenshots ? ((await page.screenshot({ encoding: "base64", fullPage: true })) as string) : undefined;
 
-  const metaCards = creditCards ?? [];
-  if (metaCards.length > 0) built.creditCards = metaCards.map((c, i) => (i === 0 ? { ...c, movements: built.creditCards?.[0]?.movements } : c));
+  const metaCards = cardSlides.map(({ card }) => card);
+  if (metaCards.length > 0) {
+    // Provisional (commit de integración de #66): los movimientos se asignan por tarjeta en el commit siguiente.
+    built.creditCards = metaCards.map((c, i) => (i === 0 ? { ...c, movements: built.creditCards?.[0]?.movements } : c));
+  }
   return { success: true, bank, ...built, screenshot: ss, debug: debugLog.join("\n") };
 }
 
