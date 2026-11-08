@@ -209,6 +209,28 @@ interface CreditCardTabParams {
 }
 
 /**
+ * Une varias respuestas del mismo endpoint sin sumar repetidos: si el portal pidió dos veces la
+ * misma lista (o páginas que se solapan), cada movimiento cuenta las veces que aparece en la
+ * respuesta que más lo trae, no la suma. Dos compras idénticas dentro de UNA respuesta se conservan.
+ */
+export function mergeCaptures(captures: unknown[], normalize: (c: unknown[]) => BankMovement[]): BankMovement[] {
+  if (captures.length <= 1) return normalize(captures);
+  const keyOf = (m: BankMovement) => [m.date, m.amount, m.description, m.installments ?? "", m.source].join("|");
+  const best = new Map<string, BankMovement[]>();
+  for (const capture of captures) {
+    const local = new Map<string, BankMovement[]>();
+    for (const m of normalize([capture])) {
+      const k = keyOf(m);
+      local.set(k, [...(local.get(k) ?? []), m]);
+    }
+    for (const [k, list] of local) {
+      if (list.length > (best.get(k)?.length ?? 0)) best.set(k, list);
+    }
+  }
+  return [...best.values()].flat();
+}
+
+/**
  * Reads one credit-card tab (por facturar / facturados) once per currency sub-tab.
  * The tab opens on pesos, so that pass reuses what the page already fetched; for dólares the
  * endpoint is cleared first, otherwise waitFor() would hand back the pesos captures. Each pass
@@ -241,7 +263,7 @@ export async function collectCreditCardTab(
 
     let found: BankMovement[];
     if (captures.length > 0) {
-      found = normalize(captures);
+      found = mergeCaptures(captures, normalize);
       for (const m of found) m.currency = currency;
     } else {
       found = await extractCreditCardMovements(page, tab, currency);

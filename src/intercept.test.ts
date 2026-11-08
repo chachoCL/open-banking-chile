@@ -59,6 +59,28 @@ describe("createInterceptor", () => {
     expect(interceptor.getAll("ep")).toHaveLength(2);
   });
 
+  it("ignora una respuesta idéntica repetida (misma petición disparada dos veces)", async () => {
+    const { page, simulateCapture } = mockPage();
+    const interceptor = await createInterceptor(page, [{ id: "ep", urlPrefix: "https://bank.cl" }]);
+
+    simulateCapture("ep", { movs: [1, 2] });
+    simulateCapture("ep", { movs: [1, 2] });
+    simulateCapture("ep", { movs: [3] });
+
+    expect(interceptor.getAll("ep")).toEqual([{ movs: [1, 2] }, { movs: [3] }]);
+  });
+
+  it("tras clear acepta de nuevo una respuesta igual a una anterior", async () => {
+    const { page, simulateCapture } = mockPage();
+    const interceptor = await createInterceptor(page, [{ id: "ep", urlPrefix: "https://bank.cl" }]);
+
+    simulateCapture("ep", { movs: [1] });
+    interceptor.clear("ep");
+    simulateCapture("ep", { movs: [1] });
+
+    expect(interceptor.getAll("ep")).toEqual([{ movs: [1] }]);
+  });
+
   it("isolates captures by endpoint id", async () => {
     const { page, simulateCapture } = mockPage();
     const interceptor = await createInterceptor(page, [

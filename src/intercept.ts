@@ -38,6 +38,10 @@ export async function createInterceptor(
   endpoints: EndpointConfig[],
 ): Promise<Interceptor> {
   const captures = new Map<string, unknown[]>();
+  // Cuerpos ya vistos por endpoint: el portal a veces dispara dos veces la misma petición
+  // (o el wrapper de fetch y el de XHR ven la misma). Dos respuestas idénticas son el mismo
+  // dato; guardarlas dos veces duplicaba todos los movimientos facturados de tarjeta.
+  const seen = new Map<string, Set<string>>();
 
   // Bridge: called from browser context → stores data in Node.js
   await page.exposeFunction(
@@ -45,6 +49,10 @@ export async function createInterceptor(
     (id: string, dataJson: string) => {
       try {
         const data: unknown = JSON.parse(dataJson);
+        const bodies = seen.get(id) ?? new Set<string>();
+        if (bodies.has(dataJson)) return;
+        bodies.add(dataJson);
+        seen.set(id, bodies);
         const existing = captures.get(id) ?? [];
         existing.push(data);
         captures.set(id, existing);
@@ -155,6 +163,7 @@ export async function createInterceptor(
 
     clear(id: string): void {
       captures.delete(id);
+      seen.delete(id);
     },
   };
 }
