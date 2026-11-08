@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { normalizeDate } from "../utils.js";
 import { MOVEMENT_SOURCE } from "../types.js";
+import type { BankMovement } from "../types.js";
 import {
+  balanceFromMovements,
+  buildSantanderAccounts,
   isSaldoInicial,
   normalizeSantanderCheckingApiMovements,
   normalizeSantanderUnbilledApiMovements,
@@ -381,5 +384,108 @@ describe("normalizeSantanderBilledApiMovements", () => {
   it("skips captures with missing nested path", () => {
     expect(normalizeSantanderBilledApiMovements([{}])).toEqual([]);
     expect(normalizeSantanderBilledApiMovements([{ DATA: {} }])).toEqual([]);
+  });
+});
+
+// ─── buildSantanderAccounts / balanceFromMovements ───────────────
+
+const mov = (over: Partial<BankMovement> = {}): BankMovement => ({
+  date: "08-11-2026",
+  postedDate: "09-11-2026",
+  description: "COMPRA DE PRUEBA",
+  amount: -1000,
+  balance: 5000,
+  currency: "CLP",
+  source: MOVEMENT_SOURCE.account,
+  ...over,
+});
+
+describe("balanceFromMovements", () => {
+  it("devuelve undefined sin movimientos", () => {
+    expect(balanceFromMovements([])).toBeUndefined();
+  });
+
+  it("usa el saldo del movimiento más nuevo (el primero)", () => {
+    expect(balanceFromMovements([mov({ balance: 7000 }), mov({ balance: 8000 })])).toBe(7000);
+  });
+
+  it("un 0 en el más nuevo es real si otros movimientos traen saldo", () => {
+    expect(balanceFromMovements([mov({ balance: 0 }), mov({ balance: 1000 })])).toBe(0);
+  });
+
+  it("si todos los saldos son 0 (la API no los trajo) el saldo es desconocido", () => {
+    expect(balanceFromMovements([mov({ balance: 0 }), mov({ balance: 0 })])).toBeUndefined();
+  });
+});
+
+describe("buildSantanderAccounts", () => {
+  const checking = { label: "Cuenta Corriente 0 000 00 00001 0", currency: "CLP" as const, movements: [] };
+  const vistaA = {
+    label: "Cuenta Vista 0 000 00 00002 0",
+    currency: "CLP" as const,
+    movements: [
+      mov({ description: "COMPRA A", amount: -300, balance: 700 }),
+      mov({ description: "ABONO B", amount: 1000, balance: 1000 }),
+    ],
+  };
+  const vistaB = { label: "Cuenta Vista 0 000 00 00003 0", currency: "CLP" as const, movements: [] };
+
+  it("devuelve una entrada por cuenta, en el orden del carrusel, con su label", () => {
+    const { accounts } = buildSantanderAccounts([checking, vistaA, vistaB]);
+    expect(accounts?.map((a) => a.label)).toEqual([
+      "Cuenta Corriente 0 000 00 00001 0",
+      "Cuenta Vista 0 000 00 00002 0",
+      "Cuenta Vista 0 000 00 00003 0",
+    ]);
+  });
+
+  it("asigna a cada cuenta solo sus movimientos y su saldo", () => {
+    const { accounts } = buildSantanderAccounts([checking, vistaA, vistaB]);
+    expect(accounts?.[0]?.movements).toEqual([]);
+    expect(accounts?.[0]?.balance).toBeUndefined();
+    expect(accounts?.[1]?.movements.map((m) => m.description)).toEqual(["COMPRA A", "ABONO B"]);
+    expect(accounts?.[1]?.balance).toBe(700);
+    expect(accounts?.[2]?.movements).toEqual([]);
+  });
+
+  it("conserva la moneda de cada cuenta", () => {
+    const usd = { label: "Cuenta Corriente Dólar 0 000 00 00004 0", currency: "USD" as const, movements: [] };
+    const { accounts } = buildSantanderAccounts([vistaA, usd]);
+    expect(accounts?.map((a) => a.currency)).toEqual(["CLP", "USD"]);
+  });
+
+  it("no deduplica movimientos entre cuentas distintas", () => {
+    const same = () => mov({ description: "IGUAL", amount: -500, balance: 900 });
+    const { accounts } = buildSantanderAccounts([
+      { label: "Cuenta Vista 0 000 00 00002 0", currency: "CLP", movements: [same()] },
+      { label: "Cuenta Vista 0 000 00 00003 0", currency: "CLP", movements: [same()] },
+    ]);
+    expect(accounts?.[0]?.movements).toHaveLength(1);
+    expect(accounts?.[1]?.movements).toHaveLength(1);
+  });
+
+  it("deduplica filas repetidas por paginación dentro de la misma cuenta", () => {
+    const row = () => mov({ description: "PAGINADA", balance: 900 });
+    const { accounts } = buildSantanderAccounts([
+      { label: "Cuenta Vista 0 000 00 00002 0", currency: "CLP", movements: [row(), row()] },
+    ]);
+    expect(accounts?.[0]?.movements).toHaveLength(1);
+  });
+
+  it("saca los movimientos de tarjeta de crédito de las cuentas", () => {
+    const tc = mov({ source: MOVEMENT_SOURCE.credit_card_unbilled, balance: 0, description: "COMPRA TC" });
+    const { accounts, creditCards } = buildSantanderAccounts([vistaA], [tc]);
+    expect(accounts?.[0]?.movements.every((m) => m.source === "account")).toBe(true);
+    expect(creditCards).toHaveLength(1);
+    expect(creditCards?.[0]?.movements?.[0]?.description).toBe("COMPRA TC");
+  });
+
+  it("sin tarjeta de crédito no agrega creditCards", () => {
+    expect(buildSantanderAccounts([vistaA]).creditCards).toBeUndefined();
+  });
+
+  it("deja el label sin definir si el carrusel no se pudo leer", () => {
+    const { accounts } = buildSantanderAccounts([{ currency: "CLP", movements: [] }]);
+    expect(accounts?.[0]?.label).toBeUndefined();
   });
 });

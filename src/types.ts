@@ -54,6 +54,8 @@ export interface AccountBalance {
   label?: string;
   /** Saldo actual */
   balance?: number;
+  /** Moneda de la cuenta, cuando el banco distingue cuentas en varias monedas (hoy solo Santander) */
+  currency?: "CLP" | "USD";
   /** Movimientos de la cuenta */
   movements: BankMovement[];
 }

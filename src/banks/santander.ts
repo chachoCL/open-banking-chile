@@ -1,5 +1,12 @@
 import type { Frame, Page } from "puppeteer-core";
-import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
+import type {
+  AccountBalance,
+  BankMovement,
+  BankScraper,
+  CreditCardBalance,
+  ScrapeResult,
+  ScraperOptions,
+} from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
 import { deduplicateMovements, closePopups, delay, normalizeDate, parseChileanAmount } from "../utils.js";
 import { createInterceptor } from "../intercept.js";
@@ -238,6 +245,57 @@ export async function collectCreditCardTab(
   // Leave the page on pesos so the next tab starts from its default state.
   if (switchedAway) await clickTcTab(page, "pesos");
   return movements;
+}
+
+// ─── Salida por cuenta ───────────────────────────────────────────────
+
+/** Movimientos de una cuenta del carrusel, tal como se leyeron del banco. */
+export interface SantanderAccountMovements {
+  /** Etiqueta del banco (ej. "Cuenta Vista 0 011 00 00000 0"); undefined si no se pudo leer el carrusel. */
+  label?: string;
+  currency: "CLP" | "USD";
+  movements: BankMovement[];
+}
+
+/**
+ * Saldo de una cuenta a partir de sus movimientos: el saldo posterior del movimiento más
+ * nuevo (el banco los entrega del más nuevo al más viejo). La API deja `balance = 0` cuando
+ * no trae saldo, así que si TODOS los movimientos tienen 0 el saldo se considera desconocido
+ * (undefined) y no 0; si hay saldos positivos en otros movimientos, un 0 en el más nuevo es real.
+ */
+export function balanceFromMovements(movements: BankMovement[]): number | undefined {
+  const newest = movements[0];
+  if (!newest) return undefined;
+  if (newest.balance !== 0) return newest.balance;
+  return movements.some((m) => m.balance !== 0) ? 0 : undefined;
+}
+
+/**
+ * Arma `accounts` con una entrada por cuenta del carrusel (label, moneda, saldo y solo sus
+ * movimientos). Las cuentas sin movimientos se conservan: identifican la cuenta aunque no
+ * haya actividad. Los movimientos de tarjeta de crédito no son de ninguna cuenta: salen
+ * aparte en `creditCards`.
+ */
+export function buildSantanderAccounts(
+  perAccount: SantanderAccountMovements[],
+  creditCardMovements: BankMovement[] = [],
+): Pick<ScrapeResult, "accounts" | "creditCards"> {
+  const accounts: AccountBalance[] = perAccount.map((a) => {
+    // La deduplicación va por cuenta: dos cuentas distintas pueden tener movimientos idénticos.
+    const movements = deduplicateMovements(a.movements);
+    const balance = balanceFromMovements(movements);
+    return {
+      ...(a.label ? { label: a.label } : {}),
+      currency: a.currency,
+      ...(balance !== undefined ? { balance } : {}),
+      movements,
+    };
+  });
+  const cc = deduplicateMovements(creditCardMovements);
+  return {
+    accounts,
+    ...(cc.length > 0 ? { creditCards: [{ label: "Tarjeta de crédito", movements: cc } satisfies CreditCardBalance] } : {}),
+  };
 }
 
 // ─── Santander-specific helpers ──────────────────────────────────────
@@ -504,7 +562,7 @@ async function scrapeSantander(
     debugLog.push(`  Accounts: ${accounts.map((a) => `${a.label} [${a.currency}]`).join(" | ")}`);
   }
 
-  let movements: BankMovement[] = [];
+  const perAccount: SantanderAccountMovements[] = [];
 
   // La API de cuentas se consulta al cargar la página, para la cuenta que esté activa en el
   // carrusel — la reutilizamos para esa cuenta en vez de perderla al hacer `clear()` más abajo.
@@ -516,6 +574,7 @@ async function scrapeSantander(
 
   if (accounts.length <= 1) {
     const currency = accounts[0]?.currency ?? "CLP";
+    const movements: BankMovement[] = [];
     if (initialCaptures.length > 0) {
       debugLog.push(`  Checking API: ${initialCaptures.length} response(s) captured`);
       const apiMovements = normalizeSantanderCheckingApiMovements(initialCaptures);
@@ -529,6 +588,7 @@ async function scrapeSantander(
       for (const m of domMovements) m.currency = currency;
       movements.push(...domMovements);
     }
+    perAccount.push({ label: accounts[0]?.label, currency, movements });
   } else {
     // Con varias cuentas, la API se dispara una vez por cuenta activa: hay que cambiar de
     // cuenta en el carrusel y esperar una captura nueva por cada una — si no, la
@@ -552,31 +612,54 @@ async function scrapeSantander(
       }
 
       const apiMovements = acctCaptures.length > 0 ? normalizeSantanderCheckingApiMovements(acctCaptures) : [];
+      let acctMovements: BankMovement[] = [];
 
       if (apiMovements.length > 0) {
         for (const m of apiMovements) m.currency = account.currency;
-        movements.push(...apiMovements);
+        acctMovements = apiMovements;
         debugLog.push(`  ${account.label} [${account.currency}] (API): ${apiMovements.length} movement(s)`);
       } else if (onAccountPage) {
         // Si esta cuenta no expone movimientos por esta API (ej. Línea de Crédito, que no
         // siempre es un producto "current-account" — o devuelve una respuesta con 0
         // movimientos en un formato distinto), volvemos al scraping de la tabla HTML. Ya
         // estamos en la página de esta cuenta, no hace falta volver a cambiar.
-        const acctMovements = await paginateAndExtract(page, extractAccountMovements, debugLog);
+        acctMovements = await paginateAndExtract(page, extractAccountMovements, debugLog);
         for (const m of acctMovements) m.currency = account.currency;
-        movements.push(...acctMovements);
         debugLog.push(`  ${account.label} [${account.currency}] (HTML): ${acctMovements.length} movement(s)`);
       }
+      perAccount.push({ label: account.label, currency: account.currency, movements: acctMovements });
     }
   }
-  movements = deduplicateMovements(movements);
+
+  // Si el carrusel no listó cuentas y tampoco hay movimientos, la página de movimientos no
+  // cargó: es un fallo (reintentable), no una cuenta vacía.
+  if (accounts.length === 0 && perAccount.every((a) => a.movements.length === 0)) {
+    debugLog.push("  0 cuentas detectadas y 0 movimientos: la página de movimientos no cargó.");
+    const ss = await page.screenshot({ encoding: "base64" });
+    return {
+      success: false,
+      bank,
+      accounts: [],
+      error: "No cargó la página de movimientos: 0 cuentas detectadas.",
+      screenshot: ss as string,
+      debug: debugLog.join("\n"),
+    };
+  }
+
+  // Cuenta única sin saldo en los movimientos: último recurso, leer el saldo de la página de
+  // movimientos (antes de salir hacia la sección de tarjetas).
+  const singleAccountPageBalance =
+    perAccount.length === 1 && balanceFromMovements(deduplicateMovements(perAccount[0]!.movements)) === undefined
+      ? await extractBalance(page)
+      : undefined;
 
   // 7b. Credit card movements
   debugLog.push("7b. Navigating to credit card movements...");
   progress("Extrayendo movimientos de tarjeta de crédito...");
+  const creditCardMovements: BankMovement[] = [];
   const tcReady = await navigateToCreditCardSection(page, debugLog);
   if (tcReady) {
-    movements.push(
+    creditCardMovements.push(
       ...(await collectCreditCardTab(page, interceptor, debugLog, {
         tabText: "movimientos por facturar",
         endpointId: "santander-credit-card-unbilled",
@@ -595,27 +678,28 @@ async function scrapeSantander(
   } else {
     debugLog.push("  Could not open credit card section.");
   }
-  movements = deduplicateMovements(movements);
 
-  // 8. Balance
-  let balance: number | undefined;
-  const withBalance = movements.find((m) => m.balance > 0);
-  if (withBalance) {
-    balance = withBalance.balance;
-    debugLog.push(`  Balance from movements: $${balance.toLocaleString("es-CL")}`);
+  // 8. Una entrada por cuenta, con su saldo (el del movimiento más nuevo).
+  const built = buildSantanderAccounts(perAccount, creditCardMovements);
+  const builtAccounts = built.accounts ?? [];
+  if (singleAccountPageBalance !== undefined && builtAccounts.length === 1 && builtAccounts[0]?.balance === undefined) {
+    builtAccounts[0]!.balance = singleAccountPageBalance;
   }
-  if (balance === undefined || balance === 0) {
-    balance = await extractBalance(page);
+  for (const a of builtAccounts) {
+    debugLog.push(
+      `  ${a.label ?? "(sin etiqueta)"} [${a.currency ?? "CLP"}]: ${a.movements.length} movement(s), balance ${
+        a.balance !== undefined ? `$${a.balance.toLocaleString("es-CL")}` : "n/d"
+      }`,
+    );
   }
-
-  debugLog.push(`8. Extracted ${movements.length} movement(s)`);
-  progress(`Listo — ${movements.length} movimientos totales`);
-  debugLog.push(balance !== undefined ? `9. Balance: $${balance.toLocaleString("es-CL")}` : "9. Balance not found");
+  const total = builtAccounts.reduce((n, a) => n + a.movements.length, 0);
+  debugLog.push(`8. Extracted ${total} account movement(s) in ${builtAccounts.length} account(s)`);
+  progress(`Listo — ${total} movimientos en ${builtAccounts.length} cuenta(s)`);
 
   await doSave(page, "05-final");
   const ss = doScreenshots ? ((await page.screenshot({ encoding: "base64", fullPage: true })) as string) : undefined;
 
-  return { success: true, bank, accounts: [{ balance, movements }], screenshot: ss, debug: debugLog.join("\n") };
+  return { success: true, bank, ...built, screenshot: ss, debug: debugLog.join("\n") };
 }
 
 // ─── Export ──────────────────────────────────────────────────────────
