@@ -139,6 +139,11 @@ describe("parseChileanAmount", () => {
   it("returns 0 for empty or non-numeric input", () => {
     expect(parseChileanAmount("")).toBe(0);
     expect(parseChileanAmount("n/a")).toBe(0);
+  });
+});
+
+// ─── normalizeDate ──────────────────────────────────────────
+
 describe("normalizeDate", () => {
   it("convierte ISO (yyyy-mm-dd) a dd-mm-yyyy", () => {
     // Santander entrega transactionDate y FechaTxs en ISO; antes salían sin convertir.
