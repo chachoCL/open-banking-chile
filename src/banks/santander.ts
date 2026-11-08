@@ -125,6 +125,15 @@ interface SantanderBilledApiMovement {
   TotalCuotas: string; // "00"
 }
 
+/**
+ * La API de facturados no trae indicador debe/haber: el abono se reconoce por el texto.
+ * Convención de signo del fork (y del contrato de Munmony): compra negativa, pago/abono positivo.
+ * "Monto Cancelado" es el pago de la tarjeta; abonos, notas de crédito y reversos también suman.
+ */
+export function isBilledCredit(description: string): boolean {
+  return /monto\s+cancelado|\babono\b|nota\s+de\s+cr[eé]dito|\breverso\b/i.test(description);
+}
+
 export function normalizeSantanderBilledApiMovements(captures: unknown[]): BankMovement[] {
   const movements: BankMovement[] = [];
   for (const capture of captures) {
@@ -141,8 +150,7 @@ export function normalizeSantanderBilledApiMovements(captures: unknown[]): BankM
       const raw = parseInt(cleaned, 10);
       if (!raw || isNaN(raw)) continue;
       if (isSaldoInicial(m.NombreComercio)) continue;
-      const isPayment = m.NombreComercio.toLowerCase().includes("monto cancelado");
-      const amount = isPayment ? raw : -raw;
+      const amount = isBilledCredit(m.NombreComercio) ? raw : -raw;
       const totalCuotas = parseInt(m.TotalCuotas.replace(/^0+/, "") || "0", 10);
       const currentCuota = parseInt(m.NumeroCuotas.replace(/^0+/, "") || "0", 10);
       const installments =
@@ -274,11 +282,11 @@ export function balanceFromMovements(movements: BankMovement[]): number | undefi
  * Arma `accounts` con una entrada por cuenta del carrusel (label, moneda, saldo y solo sus
  * movimientos). Las cuentas sin movimientos se conservan: identifican la cuenta aunque no
  * haya actividad. Los movimientos de tarjeta de crédito no son de ninguna cuenta: salen
- * aparte en `creditCards`.
+ * aparte en `creditCards`, una entrada por tarjeta (con sus movimientos, ya asignados a ella).
  */
 export function buildSantanderAccounts(
   perAccount: SantanderAccountMovements[],
-  creditCardMovements: BankMovement[] = [],
+  creditCards: CreditCardBalance[] = [],
 ): Pick<ScrapeResult, "accounts" | "creditCards"> {
   const accounts: AccountBalance[] = perAccount.map((a) => {
     // La deduplicación va por cuenta: dos cuentas distintas pueden tener movimientos idénticos.
@@ -291,11 +299,8 @@ export function buildSantanderAccounts(
       movements,
     };
   });
-  const cc = deduplicateMovements(creditCardMovements);
-  return {
-    accounts,
-    ...(cc.length > 0 ? { creditCards: [{ label: "Tarjeta de crédito", movements: cc } satisfies CreditCardBalance] } : {}),
-  };
+  const cards = creditCards.map((c) => ({ ...c, movements: deduplicateMovements(c.movements ?? []) }));
+  return { accounts, ...(cards.length > 0 ? { creditCards: cards } : {}) };
 }
 
 // ─── Santander-specific helpers ──────────────────────────────────────
@@ -690,7 +695,7 @@ async function extractActiveCreditCardMetadata(page: Page): Promise<CreditCardBa
 
 /** A captured credit card together with the carousel slide it came from, so the
  *  statement pass can re-select that slide before reading its billing summary. */
-type CreditCardWithSlide = { card: CreditCardBalance; slideIndex: number };
+export type CreditCardWithSlide = { card: CreditCardBalance; slideIndex: number };
 
 async function extractCreditCardMetadata(page: Page, debugLog: string[]): Promise<CreditCardWithSlide[]> {
   const slides = await listCreditCardSlides(page);
@@ -740,7 +745,7 @@ async function extractCreditCardMetadata(page: Page, debugLog: string[]): Promis
   return cards;
 }
 
-type LastStatementRaw = {
+export type LastStatementRaw = {
   billingDate?: string;
   billedAmount?: number;
   dueDate?: string;
@@ -849,6 +854,128 @@ function applyLastStatement(card: CreditCardBalance, raw: LastStatementRaw): boo
     if (derived) card.billingPeriod = derived;
   }
   return true;
+}
+
+// ─── Credit card: movimientos por tarjeta ────────────────────────────
+
+const TC_UNBILLED_ENDPOINT = "santander-credit-card-unbilled";
+const TC_BILLED_ENDPOINT = "santander-credit-card-billed";
+
+const UNBILLED_TAB: CreditCardTabParams = {
+  tabText: "movimientos por facturar",
+  endpointId: TC_UNBILLED_ENDPOINT,
+  tab: "unbilled",
+  normalize: normalizeSantanderUnbilledApiMovements,
+  logLabel: "TC por facturar",
+};
+const BILLED_TAB: CreditCardTabParams = {
+  tabText: "movimientos facturados",
+  endpointId: TC_BILLED_ENDPOINT,
+  tab: "billed",
+  normalize: normalizeSantanderBilledApiMovements,
+  logLabel: "TC facturados",
+};
+
+/** Lee los dos tabs (por facturar y facturados) de la tarjeta que esté activa en el carrusel. */
+async function collectCreditCardMovementsOnce(
+  page: Page,
+  interceptor: Interceptor,
+  debugLog: string[],
+): Promise<BankMovement[]> {
+  return [
+    ...(await collectCreditCardTab(page, interceptor, debugLog, UNBILLED_TAB)),
+    ...(await collectCreditCardTab(page, interceptor, debugLog, BILLED_TAB)),
+  ];
+}
+
+/** Acciones de página que usa `collectCreditCards` (inyectables para probar el orden de las operaciones). */
+export interface CreditCardOps {
+  activeSlide(page: Page): Promise<number>;
+  selectSlide(page: Page, index: number): Promise<boolean>;
+  collectMovements(page: Page, interceptor: Interceptor, debugLog: string[]): Promise<BankMovement[]>;
+  /** Abre "movimientos facturados", espera el resumen y lo lee. */
+  readStatement(page: Page, debugLog: string[], label: string): Promise<LastStatementRaw>;
+}
+
+const defaultCreditCardOps: CreditCardOps = {
+  activeSlide: getActiveCreditCardSlideIndex,
+  selectSlide: selectCreditCardSlide,
+  collectMovements: collectCreditCardMovementsOnce,
+  async readStatement(page, debugLog, label) {
+    // El resumen solo se dibuja en la vista de facturados, y navegar el carrusel/tabs puede devolver la UI a "Mi Tarjeta".
+    await clickTcTab(page, "movimientos facturados");
+    if (!(await waitForStatementRender(page))) {
+      debugLog.push(`  Statement anchor text did not appear within 10s [${label}]`);
+    }
+    return extractLastStatement(page);
+  },
+};
+
+/**
+ * Movimientos y estado de cuenta de CADA tarjeta. Las vistas de "por facturar" y "facturados" solo
+ * muestran la tarjeta seleccionada en el carrusel, así que se selecciona su slide y se lee ahí:
+ * lo capturado queda asignado a esa tarjeta. Con varias tarjetas se descartan las capturas previas
+ * (de otras tarjetas) antes de cada una; con una sola no se toca el flujo original (no navega).
+ * Si no se puede seleccionar una tarjeta se conserva con sus metadatos y sin movimientos (no se
+ * reutiliza lo capturado de otra).
+ */
+export async function collectCreditCards(
+  page: Page,
+  interceptor: Interceptor,
+  debugLog: string[],
+  cardSlides: CreditCardWithSlide[],
+  ops: CreditCardOps = defaultCreditCardOps,
+): Promise<CreditCardBalance[]> {
+  const several = cardSlides.length > 1;
+  let currentSlide = await ops.activeSlide(page);
+  const cards: CreditCardBalance[] = [];
+
+  for (const { card, slideIndex } of cardSlides) {
+    if (several) {
+      interceptor.clear(TC_UNBILLED_ENDPOINT);
+      interceptor.clear(TC_BILLED_ENDPOINT);
+    }
+    if (slideIndex >= 0 && slideIndex !== currentSlide) {
+      if (!(await ops.selectSlide(page, slideIndex))) {
+        debugLog.push(`  [${card.label}]: no se pudo seleccionar la tarjeta (slide ${slideIndex + 1}), se omiten sus movimientos`);
+        cards.push({ ...card, movements: [] });
+        continue;
+      }
+      currentSlide = slideIndex;
+    }
+
+    const movements = deduplicateMovements(await ops.collectMovements(page, interceptor, debugLog));
+    const statementRaw = await ops.readStatement(page, debugLog, card.label);
+    if (applyLastStatement(card, statementRaw)) {
+      debugLog.push(
+        `  Last statement [${card.label}]: billed=$${card.lastStatement!.billedAmount.toLocaleString("es-CL")}, ` +
+        `billingDate=${card.lastStatement!.billingDate}, dueDate=${card.lastStatement!.dueDate}` +
+        (card.lastStatement!.minimumPayment !== undefined
+          ? `, min=$${card.lastStatement!.minimumPayment.toLocaleString("es-CL")}`
+          : ""),
+      );
+    } else {
+      debugLog.push(
+        `  Last statement [${card.label}]: partial (billingDate=${statementRaw.billingDate ?? "—"}, ` +
+        `dueDate=${statementRaw.dueDate ?? "—"}, billed=${statementRaw.billedAmount ?? "—"}, ` +
+        `min=${statementRaw.minimumPayment ?? "—"})`,
+      );
+    }
+    cards.push({ ...card, movements });
+  }
+
+  // Si el cambio de slide no surtió efecto, dos tarjetas mostrarían la misma lista: se deja constancia.
+  const signature = (c: CreditCardBalance) =>
+    (c.movements ?? []).map((m) => `${m.source}|${m.date}|${m.amount}|${m.description}`).join("\n");
+  const seen = new Map<string, string>();
+  for (const c of cards) {
+    const sig = signature(c);
+    if (!sig) continue;
+    const prev = seen.get(sig);
+    if (prev) debugLog.push(`  ADVERTENCIA: ${c.label} y ${prev} tienen movimientos idénticos (¿no cambió la tarjeta del carrusel?)`);
+    else seen.set(sig, c.label);
+  }
+  return cards;
 }
 
 // ─── Main scrape function ────────────────────────────────────────────
@@ -1064,74 +1191,25 @@ async function scrapeSantander(
   // 7b. Credit card movements
   debugLog.push("7b. Navigating to credit card movements...");
   progress("Extrayendo movimientos de tarjeta de crédito...");
-  let cardSlides: CreditCardWithSlide[] = [];
-  const creditCardMovements: BankMovement[] = [];
+  let creditCards: CreditCardBalance[] = [];
   const tcReady = await navigateToCreditCardSection(page, debugLog);
   if (tcReady) {
-    cardSlides = await extractCreditCardMetadata(page, debugLog);
-
-    creditCardMovements.push(
-      ...(await collectCreditCardTab(page, interceptor, debugLog, {
-        tabText: "movimientos por facturar",
-        endpointId: "santander-credit-card-unbilled",
-        tab: "unbilled",
-        normalize: normalizeSantanderUnbilledApiMovements,
-        logLabel: "TC por facturar",
-      })),
-      ...(await collectCreditCardTab(page, interceptor, debugLog, {
-        tabText: "movimientos facturados",
-        endpointId: "santander-credit-card-billed",
-        tab: "billed",
-        normalize: normalizeSantanderBilledApiMovements,
-        logLabel: "TC facturados",
-      })),
-    );
-
+    const cardSlides = await extractCreditCardMetadata(page, debugLog);
     if (cardSlides.length > 0) {
-      // Billing summary (statement info) for EVERY credit card, not just the first.
-      // The "movimientos facturados" view only reflects the card currently selected in the
-      // carousel, so each card's slide is re-selected before reading its statement.
-      let currentSlide = await getActiveCreditCardSlideIndex(page);
-      for (const { card, slideIndex } of cardSlides) {
-        if (slideIndex >= 0 && slideIndex !== currentSlide) {
-          if (await selectCreditCardSlide(page, slideIndex)) {
-            currentSlide = slideIndex;
-          } else {
-            debugLog.push(
-              `  Last statement [${card.label}]: no se pudo seleccionar la tarjeta (slide ${slideIndex + 1}), se omite`,
-            );
-            continue;
-          }
-        }
-        await clickTcTab(page, "movimientos facturados");
-        const rendered = await waitForStatementRender(page);
-        if (!rendered) {
-          debugLog.push(`  Statement anchor text did not appear within 10s [${card.label}]`);
-        }
-        const statementRaw = await extractLastStatement(page);
-        if (applyLastStatement(card, statementRaw)) {
-          debugLog.push(
-            `  Last statement [${card.label}]: billed=$${card.lastStatement!.billedAmount.toLocaleString("es-CL")}, ` +
-            `billingDate=${card.lastStatement!.billingDate}, dueDate=${card.lastStatement!.dueDate}` +
-            (card.lastStatement!.minimumPayment !== undefined
-              ? `, min=$${card.lastStatement!.minimumPayment.toLocaleString("es-CL")}`
-              : ""),
-          );
-        } else {
-          debugLog.push(
-            `  Last statement [${card.label}]: partial (billingDate=${statementRaw.billingDate ?? "—"}, ` +
-            `dueDate=${statementRaw.dueDate ?? "—"}, billed=${statementRaw.billedAmount ?? "—"}, ` +
-            `min=${statementRaw.minimumPayment ?? "—"})`,
-          );
-        }
-      }
+      creditCards = await collectCreditCards(page, interceptor, debugLog, cardSlides);
+    } else {
+      // Sin metadatos (los selectores del carrusel cambiaron): se conservan los movimientos en una
+      // entrada sin identificar. El consumidor no puede ubicarla por tarjeta; queda en el log.
+      debugLog.push("  TC: sin metadatos de tarjeta, movimientos sin asignar a una tarjeta");
+      const legacy = await collectCreditCardMovementsOnce(page, interceptor, debugLog);
+      if (legacy.length > 0) creditCards = [{ label: "Tarjeta de crédito", movements: legacy }];
     }
   } else {
     debugLog.push("  Could not open credit card section.");
   }
 
   // 8. Una entrada por cuenta, con su saldo (el del movimiento más nuevo).
-  const built = buildSantanderAccounts(perAccount, creditCardMovements);
+  const built = buildSantanderAccounts(perAccount, creditCards);
   const builtAccounts = built.accounts ?? [];
   if (singleAccountPageBalance !== undefined && builtAccounts.length === 1 && builtAccounts[0]?.balance === undefined) {
     builtAccounts[0]!.balance = singleAccountPageBalance;
@@ -1143,6 +1221,9 @@ async function scrapeSantander(
       }`,
     );
   }
+  for (const c of built.creditCards ?? []) {
+    debugLog.push(`  ${c.label}: ${c.movements?.length ?? 0} TC movement(s)`);
+  }
   const total = builtAccounts.reduce((n, a) => n + a.movements.length, 0);
   debugLog.push(`8. Extracted ${total} account movement(s) in ${builtAccounts.length} account(s)`);
   progress(`Listo — ${total} movimientos en ${builtAccounts.length} cuenta(s)`);
@@ -1150,11 +1231,6 @@ async function scrapeSantander(
   await doSave(page, "05-final");
   const ss = doScreenshots ? ((await page.screenshot({ encoding: "base64", fullPage: true })) as string) : undefined;
 
-  const metaCards = cardSlides.map(({ card }) => card);
-  if (metaCards.length > 0) {
-    // Provisional (commit de integración de #66): los movimientos se asignan por tarjeta en el commit siguiente.
-    built.creditCards = metaCards.map((c, i) => (i === 0 ? { ...c, movements: built.creditCards?.[0]?.movements } : c));
-  }
   return { success: true, bank, ...built, screenshot: ss, debug: debugLog.join("\n") };
 }
 

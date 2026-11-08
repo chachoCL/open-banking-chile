@@ -45,6 +45,20 @@ describe("extractCreditCardMovements", () => {
     expect(result[0]).toMatchObject({ description: "COMPRA SUPERMERCADO", amount: -12345 });
   });
 
+  it("sin columna de signo: pago de la tarjeta suma, 'pago recurrente' es un cargo", async () => {
+    stubDocument([
+      ["06/08/2026", "PAGO TARJETA", "$100.000"],
+      ["06/08/2026", "PAGO RECURRENTE VD SPOTIFY", "$2.759"],
+    ]);
+
+    const result = await extractCreditCardMovements(isolatedPage(), "billed");
+
+    expect(result.map((m) => [m.description, m.amount])).toEqual([
+      ["PAGO TARJETA", 100000],
+      ["PAGO RECURRENTE VD SPOTIFY", -2759],
+    ]);
+  });
+
   it("tags every movement as CLP by default", async () => {
     stubDocument([["06/08/2026", "COMPRA", "$1.000"]]);
 

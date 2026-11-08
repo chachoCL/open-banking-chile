@@ -5,7 +5,9 @@ import type { BankMovement } from "../types.js";
 import {
   balanceFromMovements,
   buildSantanderAccounts,
+  isBilledCredit,
   isSaldoInicial,
+  collectCreditCards,
   normalizeSantanderCheckingApiMovements,
   normalizeSantanderUnbilledApiMovements,
   normalizeSantanderBilledApiMovements,
@@ -475,12 +477,21 @@ describe("buildSantanderAccounts", () => {
     expect(accounts?.[0]?.movements).toHaveLength(1);
   });
 
-  it("saca los movimientos de tarjeta de crédito de las cuentas", () => {
-    const tc = mov({ source: MOVEMENT_SOURCE.credit_card_unbilled, balance: 0, description: "COMPRA TC" });
-    const { accounts, creditCards } = buildSantanderAccounts([vistaA], [tc]);
+  it("deja los movimientos de cada tarjeta en su propia entrada, fuera de las cuentas", () => {
+    const tc = (description: string) =>
+      mov({ source: MOVEMENT_SOURCE.credit_card_unbilled, balance: 0, description });
+    const { accounts, creditCards } = buildSantanderAccounts(
+      [vistaA],
+      [
+        { label: "Mastercard Black ****1111", movements: [tc("COMPRA TC A"), tc("COMPRA TC A")] },
+        { label: "Visa Gold ****2222", movements: [tc("COMPRA TC B")] },
+      ],
+    );
     expect(accounts?.[0]?.movements.every((m) => m.source === "account")).toBe(true);
-    expect(creditCards).toHaveLength(1);
-    expect(creditCards?.[0]?.movements?.[0]?.description).toBe("COMPRA TC");
+    expect(creditCards?.map((c) => c.label)).toEqual(["Mastercard Black ****1111", "Visa Gold ****2222"]);
+    // balance = 0 (API): dos compras idénticas el mismo día son reales y no se colapsan.
+    expect(creditCards?.[0]?.movements).toHaveLength(2);
+    expect(creditCards?.[1]?.movements?.[0]?.description).toBe("COMPRA TC B");
   });
 
   it("sin tarjeta de crédito no agrega creditCards", () => {
@@ -575,5 +586,111 @@ describe("buildCreditCardFromRaw", () => {
       nextBillingDate: null,
     });
     expect(card).toBeNull();
+  });
+});
+
+// ─── signo de facturados ─────────────────────────────────────────
+
+describe("isBilledCredit / signo de movimientos facturados", () => {
+  const billed = (name: string) =>
+    normalizeSantanderBilledApiMovements([
+      { DATA: { AS_TIB_WM02_CONEstCtaNacional_Response: { OUTPUT: { Matriz: [
+        { FechaTxs: "2026-01-25", NombreComercio: name, MontoTxs: "0000010000", NumeroCuotas: "00", TotalCuotas: "00" },
+      ] } } } },
+    ])[0]!.amount;
+
+  it("compra negativa; pago, abono, nota de crédito y reverso positivos", () => {
+    expect(billed("FARMACIA CRUZ VERDE")).toBe(-10000);
+    expect(billed("PAGO RECURRENTE VD GOOGLE ONE")).toBe(-10000);
+    expect(billed("Monto Cancelado")).toBe(10000);
+    expect(billed("ABONO POR DEVOLUCION")).toBe(10000);
+    expect(billed("NOTA DE CREDITO TIENDA")).toBe(10000);
+    expect(billed("REVERSO COMPRA")).toBe(10000);
+  });
+
+  it("no confunde palabras que contienen 'abono'", () => {
+    expect(isBilledCredit("ABONOS Y FLORES LTDA")).toBe(false);
+    expect(isBilledCredit("ABONO")).toBe(true);
+  });
+});
+
+// ─── collectCreditCards ──────────────────────────────────────────
+
+describe("collectCreditCards", () => {
+  const page = {} as never;
+  const mk = (description: string, over: Partial<BankMovement> = {}): BankMovement => ({
+    date: "01-11-2026", description, amount: -1000, balance: 0, source: MOVEMENT_SOURCE.credit_card_unbilled, currency: "CLP", ...over,
+  });
+  const slideOf = (label: string, slideIndex: number) => ({ card: { label } as never, slideIndex });
+
+  function harness(opts: { active?: number; failSelect?: number[]; statement?: Record<string, object> } = {}) {
+    const events: string[] = [];
+    let current = opts.active ?? 0;
+    const interceptor = {
+      getAll: () => [],
+      waitFor: async () => [],
+      clear: (id: string) => void events.push(`clear:${id.replace("santander-credit-card-", "")}`),
+    };
+    const ops = {
+      activeSlide: async () => current,
+      selectSlide: async (_p: unknown, i: number) => {
+        events.push(`select:${i}`);
+        if (opts.failSelect?.includes(i)) return false;
+        current = i;
+        return true;
+      },
+      collectMovements: async () => {
+        events.push(`collect:${current}`);
+        return [mk(`COMPRA SLIDE ${current}`)];
+      },
+      readStatement: async () => {
+        events.push(`statement:${current}`);
+        return (opts.statement?.[String(current)] ?? {}) as never;
+      },
+    };
+    return { events, interceptor, ops };
+  }
+
+  it("una sola tarjeta: no navega ni descarta capturas", async () => {
+    const h = harness();
+    const [c] = await collectCreditCards(page, h.interceptor, [], [slideOf("Visa ****1111", 0)], h.ops);
+    expect(h.events).toEqual(["collect:0", "statement:0"]);
+    expect(c!.movements!.map((m) => m.description)).toEqual(["COMPRA SLIDE 0"]);
+  });
+
+  it("varias tarjetas: descarta capturas, selecciona y asigna los movimientos a cada una", async () => {
+    const h = harness({ active: 1, statement: { "0": { billingDate: "05-10-2026", dueDate: "15-10-2026", billedAmount: 50000 } } });
+    const cards = await collectCreditCards(
+      page, h.interceptor, [], [slideOf("Visa ****1111", 0), slideOf("Mastercard ****2222", 1)], h.ops,
+    );
+    expect(h.events).toEqual([
+      "clear:unbilled", "clear:billed", "select:0", "collect:0", "statement:0",
+      "clear:unbilled", "clear:billed", "select:1", "collect:1", "statement:1",
+    ]);
+    expect(cards.map((c) => [c.label, c.movements!.map((m) => m.description)])).toEqual([
+      ["Visa ****1111", ["COMPRA SLIDE 0"]],
+      ["Mastercard ****2222", ["COMPRA SLIDE 1"]],
+    ]);
+    expect(cards[0]!.lastStatement?.billedAmount).toBe(50000);
+    expect(cards[1]!.lastStatement).toBeUndefined();
+  });
+
+  it("si no puede seleccionar una tarjeta la deja sin movimientos y no reutiliza los de otra", async () => {
+    const h = harness({ failSelect: [1] });
+    const log: string[] = [];
+    const cards = await collectCreditCards(
+      page, h.interceptor, log, [slideOf("Visa ****1111", 0), slideOf("Mastercard ****2222", 1)], h.ops,
+    );
+    expect(cards[0]!.movements).toHaveLength(1);
+    expect(cards[1]!.movements).toEqual([]);
+    expect(log.join("\n")).toContain("no se pudo seleccionar");
+  });
+
+  it("advierte si dos tarjetas devuelven exactamente los mismos movimientos", async () => {
+    const h = harness();
+    h.ops.collectMovements = async () => [mk("IGUAL")];
+    const log: string[] = [];
+    await collectCreditCards(page, h.interceptor, log, [slideOf("A ****1111", 0), slideOf("B ****2222", 1)], h.ops);
+    expect(log.join("\n")).toContain("ADVERTENCIA");
   });
 });

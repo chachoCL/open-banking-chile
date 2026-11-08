@@ -13,7 +13,8 @@ function isCreditCardCredit(description: string): boolean {
     text.includes("nota de credito") ||
     text.includes("nota de crédito") ||
     text.includes("reverso") ||
-    /^pago\b/.test(text)
+    // "PAGO RECURRENTE ..." es un cargo (suscripción), no un pago de la tarjeta.
+    (/^pago\b/.test(text) && !/^pago\s+recurrente\b/.test(text))
   );
 }
 
