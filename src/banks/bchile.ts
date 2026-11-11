@@ -27,7 +27,21 @@ interface ApiFechaFacturacion { fechaFacturacion: string; existeEstadoCuentaNaci
 interface ApiTransaccionFacturada { fechaTransaccionString: string; montoTransaccion: number; descripcion: string; cuotas: string; grupo: string; }
 interface ApiResumenNested { montoFacturado?: number; pagoMinimo?: number; fechaFacturacionActual?: string; fechaVencimientoFacturacion?: string; fechaProximaFacturacion?: string; }
 interface ApiResumenFacturado { existeEstadoCuenta: boolean; seccionOperaciones?: { transaccionesTarjetas: ApiTransaccionFacturada[] }; seccionCargosImpuestosAbonos?: { transaccionesTarjetas: ApiTransaccionFacturada[] | null }; resumen?: ApiResumenNested; totalFacturado?: number; montoTotalFacturado?: number; montoTotal?: number; fechaVencimiento?: string; fechaPago?: string; pagoMinimo?: number; montoMinimoPago?: number; montoMinimoAPagar?: number; }
-interface ApiCartolaMov { descripcion: string; monto: number; saldo: number; tipo: string; fechaContable: string; }
+interface ApiCartolaMov { descripcion: string; monto: number | string; saldo: number | string; tipo: string; fechaContable: string; }
+
+/**
+ * La cartola de Banco de Chile a veces trae montos y saldos como texto ("15000", "15000.0", "15.000", "15.000,50").
+ * Devuelve el número o NaN si no se entiende (el servidor lo rechaza en vez de inventar un monto).
+ */
+export function bchileNumber(v: number | string | null | undefined): number {
+  if (typeof v === "number") return v;
+  if (v == null) return NaN;
+  const t = String(v).trim().replace(/\$|\s/g, "");
+  if (t === "") return NaN;
+  if (/^-?\d+(\.\d+)?$/.test(t) && !/^-?\d{1,3}(\.\d{3})+$/.test(t)) return Number(t);
+  if (/^-?[\d.]+(,\d+)?$/.test(t)) return Number(t.replace(/\./g, "").replace(",", "."));
+  return NaN;
+}
 type ApiCartolaResponse = { movimientos: ApiCartolaMov[]; pagina: Array<{ totalRegistros: number; masPaginas: boolean }> };
 
 // ─── API helpers ─────────────────────────────────────────────────
@@ -235,8 +249,8 @@ function cartolaMovToMovement(mov: ApiCartolaMov, accountLabel: string): BankMov
   return {
     date: normalizeDate(mov.fechaContable),
     description: mov.descripcion.trim(),
-    amount: mov.tipo === "cargo" ? -Math.abs(mov.monto) : Math.abs(mov.monto),
-    balance: mov.saldo,
+    amount: mov.tipo === "cargo" ? -Math.abs(bchileNumber(mov.monto)) : Math.abs(bchileNumber(mov.monto)),
+    balance: bchileNumber(mov.saldo),
     source: MOVEMENT_SOURCE.account,
     account: accountLabel,
   };
@@ -308,7 +322,7 @@ async function fetchAccountMovements(
       debugLog.push(`    producto tipo=${acct.tipo} clase=${acct.claseCuenta} codigo=${acct.codigo} moneda=${acct.codigoMoneda}; cartola: ${cartola.movimientos ? `${cartola.movimientos.length} mov, total=${cartola.pagina?.[0]?.totalRegistros ?? "?"}` : `sin "movimientos" (claves: ${Object.keys(cartola ?? {}).join(",")})`}`);
       if (cartola.movimientos) {
         for (const mov of cartola.movimientos) accountMovements.push(cartolaMovToMovement(mov, label));
-        if (acct.codigoMoneda === "CLP" && cartola.movimientos.length > 0) balance = cartola.movimientos[0].saldo;
+        if (acct.codigoMoneda === "CLP" && cartola.movimientos.length > 0) balance = bchileNumber(cartola.movimientos[0].saldo);
 
         let hasMore = cartola.movimientos.length > 0 && (cartola.pagina?.[0]?.masPaginas ?? false);
         let offset = 1 + cartola.movimientos.length;

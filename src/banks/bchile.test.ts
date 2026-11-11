@@ -150,3 +150,19 @@ describe("facturadoToMovement", () => {
     });
   });
 });
+
+describe("bchileNumber", () => {
+  it("entiende números y textos de la cartola", async () => {
+    const { bchileNumber } = await import("./bchile.js");
+    expect(bchileNumber(15000)).toBe(15000);
+    expect(bchileNumber("15000")).toBe(15000);
+    expect(bchileNumber("15000.0")).toBe(15000);
+    expect(bchileNumber("-2500")).toBe(-2500);
+    expect(bchileNumber("15.000")).toBe(15000);
+    expect(bchileNumber("1.234.567")).toBe(1234567);
+    expect(bchileNumber("15.000,50")).toBe(15000.5);
+    expect(bchileNumber("$ 15.000")).toBe(15000);
+    expect(bchileNumber("")).toBeNaN();
+    expect(bchileNumber("abc")).toBeNaN();
+  });
+});
