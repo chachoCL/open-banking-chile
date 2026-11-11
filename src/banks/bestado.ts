@@ -355,7 +355,7 @@ async function scrapeBestado(
   await doSave(page, "07-final");
   const ss = doScreenshots ? await page.screenshot({ encoding: "base64" }) as string : undefined;
 
-  return { success: true, bank, accounts: [{ balance, movements: deduplicated }], screenshot: ss, debug: debugLog.join("\n") };
+  return { success: true, bank, accounts: [{ label: "CuentaRUT", balance, movements: deduplicated }], screenshot: ss, debug: debugLog.join("\n") };
 }
 
 // ─── Export ──────────────────────────────────────────────────────

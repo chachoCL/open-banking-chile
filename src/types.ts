@@ -28,7 +28,11 @@ export interface BankMovement {
   /** Origen: cuenta corriente, TC no facturada, TC facturada */
   source: MovementSource;
   /** Moneda de la cuenta de origen (hoy solo lo distingue Santander, para bancos que tienen cuentas CLP y USD) */
-  currency?: "CLP" | "USD";
+  currency?: "CLP" | "USD" | (string & {});
+  /** Equivalente en pesos chilenos cuando el banco lo expone por separado */
+  amountCLP?: number;
+  /** Cuenta de origen cuando el titular tiene varios productos (ej: "Cuenta Corriente ****2706") */
+  account?: string;
   /** Titular o adicional de la tarjeta */
   owner?: CardOwner;
   /** Identificador de la tarjeta (ej: "****8335") — útil cuando hay múltiples tarjetas */
@@ -207,6 +211,11 @@ export interface ScraperOptions extends BankCredentials {
   onProgress?: (step: string) => void;
   /** Callback invocado en cada línea de debug en tiempo real */
   onDebug?: (line: string) => void;
+  /**
+   * Solo importar movimientos posteriores a esta fecha (formato dd-mm-yyyy).
+   * El scraper sigue consultando la cartola completa; el filtro se aplica al resultado.
+   */
+  since?: string;
 }
 
 /** Interfaz que debe implementar cada banco */
