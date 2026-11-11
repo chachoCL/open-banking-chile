@@ -305,6 +305,7 @@ async function fetchAccountMovements(
       await apiPost(page, "movimientos/getConfigConsultaMovimientos", { cuentasSeleccionadas: [cuentaSeleccionada] });
       const cartola = await apiPost<ApiCartolaResponse>(page, "bff-pper-prd-cta-movimientos/movimientos/getCartola", { cuentaSeleccionada, cabecera: { statusGenerico: true, paginacionDesde: 1 } });
 
+      debugLog.push(`    producto tipo=${acct.tipo} clase=${acct.claseCuenta} codigo=${acct.codigo} moneda=${acct.codigoMoneda}; cartola: ${cartola.movimientos ? `${cartola.movimientos.length} mov, total=${cartola.pagina?.[0]?.totalRegistros ?? "?"}` : `sin "movimientos" (claves: ${Object.keys(cartola ?? {}).join(",")})`}`);
       if (cartola.movimientos) {
         for (const mov of cartola.movimientos) accountMovements.push(cartolaMovToMovement(mov, label));
         if (acct.codigoMoneda === "CLP" && cartola.movimientos.length > 0) balance = cartola.movimientos[0].saldo;
@@ -484,11 +485,13 @@ async function scrapeBchile(session: BrowserSession, options: ScraperOptions): P
 
   // Balance
   let balance: number | undefined;
+  let saldos: Array<{ moneda: string; tipo: string; disponible: number; numero?: string }> = [];
   try {
-    const saldos = await apiGet<Array<{ moneda: string; tipo: string; disponible: number }>>(page, "bff-pp-prod-ctas-saldos/productos/cuentas/saldos");
+    saldos = await apiGet<typeof saldos>(page, "bff-pp-prod-ctas-saldos/productos/cuentas/saldos");
+    debugLog.push(`  Saldos: ${saldos.map((s) => `${s.tipo}/${s.moneda}`).join(", ") || "(ninguno)"}`);
     const clp = saldos.find(s => s.moneda === "CLP" && s.tipo === "CUENTA_CORRIENTE");
     if (clp) { balance = clp.disponible; debugLog.push(`  Balance CLP: $${balance}`); }
-  } catch { /* ignore */ }
+  } catch (err) { debugLog.push(`  Saldos no disponibles: ${err instanceof Error ? err.message : String(err)}`); }
 
   const fullName = products.nombre || `${clientData.datosCliente.nombres} ${clientData.datosCliente.apellidoPaterno}`.trim();
 
@@ -496,6 +499,12 @@ async function scrapeBchile(session: BrowserSession, options: ScraperOptions): P
   debugLog.push("6. Fetching account movements via API...");
   progress("Extrayendo movimientos de cuenta...");
   let accountBuckets = await fetchAccountMovements(page, products.productos, fullName, products.rut, debugLog);
+  // Saldo de cada cuenta desde el endpoint de saldos (sirve aunque la cartola venga vacía).
+  for (const bucket of accountBuckets) {
+    const product = products.productos.find((p) => accountLabelFromProduct(p) === bucket.label);
+    const saldo = product ? saldos.find((s) => s.numero && s.numero.replace(/\D/g, "") === product.numero.replace(/\D/g, "")) : undefined;
+    if (saldo && saldo.moneda === "CLP" && typeof saldo.disponible === "number") bucket.balance = saldo.disponible;
+  }
   if (balance === undefined) {
     const clpBucket = accountBuckets.find((bucket) => bucket.balance != null);
     if (clpBucket?.balance != null) balance = clpBucket.balance;
